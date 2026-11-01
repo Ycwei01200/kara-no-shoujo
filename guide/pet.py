@@ -3,12 +3,16 @@ import json
 import os
 import queue
 import sys
+import time
 import tkinter as tk
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if sys.stderr is None or os.path.basename(sys.executable).lower().startswith('pythonw'):
+    # no console: keep errors in a log file instead of dying silently
+    sys.stdout = sys.stderr = open(os.path.join(HERE, 'pet.log'), 'w', encoding='utf-8', buffering=1)
 sys.path.insert(0, HERE)
-from core import PHOTO, GuideData, Tracker, Watcher, default_ending, hint_text  # noqa: E402
+from core import HINTS, PHOTO, deduc_x_text, GuideData, Tracker, Watcher, default_ending, hint_text  # noqa: E402
 
 SETTINGS = os.path.join(HERE, 'pet_settings.json')
 KEY = '#010203'            # transparent colour key
@@ -68,6 +72,15 @@ class Pet:
         self.place()
         self.watcher.start()
         root.after(200, self.poll)
+        root.after(1000, self.stay_on_top)
+
+    def stay_on_top(self):
+        # the game re-takes the top when it gets focus; push ourselves back above it
+        try:
+            self.root.attributes('-topmost', True)
+            self.root.lift()
+        finally:
+            self.root.after(1000, self.stay_on_top)
 
     # ---------------- persistence
     def load(self):
@@ -113,8 +126,9 @@ class Pet:
         self.root.update_idletasks()
         w, h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
         self.root.geometry(f'+{self.ax - w}+{self.ay - h}')
-        # fixed footprint (largest bubble), so the blanked area never changes size
-        self.watcher.exclude = (self.ax - EXCL_W, self.ay - EXCL_H, EXCL_W, EXCL_H)
+        # fixed footprint (largest bubble) plus the real window, which can be taller
+        self.watcher.exclude = [(self.ax - EXCL_W, self.ay - EXCL_H, EXCL_W, EXCL_H),
+                                (self.ax - w, self.ay - h, w, h)]
 
     def show(self, main, sub='', photos=None, color=BFG):
         if self.hide_job:
@@ -126,11 +140,12 @@ class Pet:
             w.destroy()
         self.photos.clear()
         for f in photos or []:
-            p = os.path.join(PHOTO, f)
+            big = f.startswith('search_')
+            p = os.path.join(HINTS if big else PHOTO, f)
             try:
                 from PIL import Image, ImageTk
                 im = Image.open(p).convert('RGBA')
-                im.thumbnail((48, 48))
+                im.thumbnail((660, 190) if big else (48, 48))
                 ph = ImageTk.PhotoImage(im)
             except Exception:
                 continue
@@ -160,13 +175,15 @@ class Pet:
         if on:
             n = len(self.tr.steps)
             s = f'目標：{self.tr.title}\n進度：第 {min(self.tr.ptr + 1, n)}/{n} 步'
+            if self.tr.act:
+                s += f'（遊戲目前 {self.tr.act}）'
             if self.problem:
                 s += f'\n⚠ {self.problem}'
             elif self.tr.offroute:
                 s += '\n⚠ 目前場景不在這條路線上'
             if self.watcher.paused:
                 s += '\n（已暫停）'
-            s += '\n提示：別把我放在遊戲的選項上方'
+            s += '\n提示：遊戲要用視窗模式（Alt+Enter 切換）\n別把我放在遊戲的選項上方'
             self.show('攻略桌寵', s)
         else:
             self.hide()
@@ -268,23 +285,36 @@ class Pet:
         finally:
             self.root.after(200, self.poll)
 
-    def on_ocr(self, rect, lines):
+    def on_ocr(self, rect, lines, title=''):
         ring = self.ring_color()
-        kind, i = self.tr.classify(rect, lines)
-        if kind in ('select', 'map', 'deduc') and i is not None:
-            if self.active and self.active != (kind, i) and self.active[1] is not None:
+        kind, i = self.tr.classify(rect, lines, title)
+        # diagnostics for guide/pet.log: what was read and what it was taken for
+        print(time.strftime('%H:%M:%S'), title[-12:], f'ptr={self.tr.ptr}', kind, i,
+              '|', ' / '.join(t for t, _ in lines))
+        if kind in ('select', 'map', 'deduc', 'search') and i is not None:
+            if self.active and self.active != (kind, i) and self.active[0] in ('select', 'map', 'deduc', 'search'):
                 self.tr.leave(*self.active)
             self.tr.ptr = i
             self.tr.offroute = False
             if self.active != (kind, i):
                 self.active = (kind, i)
                 main, sub = hint_text(self.gd, self.tr, i)
-                ph = self.tr.steps[i].get('photo')
+                ph = self.tr.steps[i].get('photo') or self.tr.steps[i].get('thumb')
                 self.show(main, sub, ph if isinstance(ph, list) else ([ph] if ph else None))
+        elif kind == 'hold':
+            pass
+        elif kind == 'deduc_x':
+            key = ('deduc_x', i['file'] + i['block'])
+            if self.active != key:
+                self.active = key
+                main, sub = deduc_x_text(i)
+                self.show(main, sub, color=WARN)
         elif kind == 'offselect':
             self.active = ('off', None)
             self.show('這題不在目標路線上', '前面可能選錯了：讀取較早的存檔，\n或右鍵 →「完整路線」手動指定位置。', color=WARN)
-        elif self.active:
+        elif self.active and i == 'dialog':
+            # only a recognised story line means the hinted screen is really gone
+            # (a blank / half-drawn frame, or our bubble covering the buttons, is not)
             k, idx = self.active
             if k in ('select', 'map', 'deduc'):
                 self.tr.leave(k, idx)

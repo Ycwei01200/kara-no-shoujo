@@ -2,6 +2,7 @@
 import asyncio
 import ctypes
 import ctypes.wintypes as wt
+import os
 
 import mss
 from PIL import Image
@@ -32,7 +33,7 @@ def engine():
 PREFIXES = ('殼之少女HD', '殻ノ少女HD', 'THE SHELL HD', '壳之少女HD')
 
 
-def find_game_window(title_keywords=('The Shell', '殼之少女', '殻ノ少女', '壳之少女')):
+def find_game_window(title_keywords=('The Shell', '殼之少女', '殻ノ少女', '壳之少女'), with_title=False):
     """Return (x, y, w, h) of the game's client area, or None.
     Windows whose title starts with the real game title (list_windows_tw.tbl gametitle)
     are tried first, so a browser tab or folder named after the game is not picked."""
@@ -51,11 +52,11 @@ def find_game_window(title_keywords=('The Shell', '殼之少女', '殻ノ少女'
         if any(k.lower() in t.lower() for k in title_keywords) and 'guide' not in t.lower() \
                 and '攻略' not in t:
             pri = 0 if t.upper().startswith(tuple(p.upper() for p in PREFIXES)) else 1
-            found.append((pri, hwnd))
+            found.append((pri, hwnd, t))
         return True
 
     user32.EnumWindows(cb, 0)
-    for _, hwnd in sorted(found, key=lambda x: x[0]):
+    for _, hwnd, title in sorted(found, key=lambda x: x[0]):
         if user32.IsIconic(hwnd):
             continue
         r = wt.RECT()
@@ -64,11 +65,71 @@ def find_game_window(title_keywords=('The Shell', '殼之少女', '殻ノ少女'
         user32.ClientToScreen(hwnd, ctypes.byref(pt))
         w, h = r.right - r.left, r.bottom - r.top
         if w > 200 and h > 200:
-            return pt.x, pt.y, w, h
+            global last_hwnd
+            last_hwnd = hwnd
+            return ((pt.x, pt.y, w, h), title) if with_title else (pt.x, pt.y, w, h)
     return None
 
 
 _sct = None
+last_hwnd = None
+
+
+def _cloaked(h):
+    v = ctypes.c_int(0)
+    try:
+        ctypes.windll.dwmapi.DwmGetWindowAttribute(wt.HWND(h), 14, ctypes.byref(v), 4)   # DWMWA_CLOAKED
+    except Exception:
+        return False
+    return v.value != 0
+
+
+def covered_fraction(hwnd=None):
+    """Share of the game's client area covered by other programs' windows above it
+    (our own pet window does not count)."""
+    hwnd = hwnd or last_hwnd
+    if not hwnd:
+        return 1.0
+    r = wt.RECT()
+    user32.GetClientRect(hwnd, ctypes.byref(r))
+    pt = wt.POINT(0, 0)
+    user32.ClientToScreen(hwnd, ctypes.byref(pt))
+    gx0, gy0, gx1, gy1 = pt.x, pt.y, pt.x + r.right, pt.y + r.bottom
+    area = max(1, (gx1 - gx0) * (gy1 - gy0))
+    me = os.getpid()
+    user32.GetWindow.restype = wt.HWND
+    rects = []
+    h = user32.GetWindow(hwnd, 3)                      # GW_HWNDPREV: windows above in z-order
+    while h:
+        ex = user32.GetWindowLongW(h, -20)                 # GWL_EXSTYLE
+        clickthrough = ex & 0x20 or (ex & 0x80000 and ex & 0x80)   # TRANSPARENT, or LAYERED tool window
+        if user32.IsWindowVisible(h) and not user32.IsIconic(h) and not _cloaked(h) and not clickthrough:
+            pid = wt.DWORD()
+            user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            if pid.value != me:
+                wr = wt.RECT()
+                user32.GetWindowRect(h, ctypes.byref(wr))
+                x0, y0 = max(wr.left, gx0), max(wr.top, gy0)
+                x1, y1 = min(wr.right, gx1), min(wr.bottom, gy1)
+                if x1 > x0 and y1 > y0:
+                    rects.append((x0, y0, x1, y1))
+        h = user32.GetWindow(h, 3)
+    if not rects:
+        return 0.0
+    # union area on a coarse grid (cheap and good enough)
+    step = 8
+    cov, limit = 0, 0.02 * area / (step * step)
+    for y in range(gy0, gy1, step):
+        for x in range(gx0, gx1, step):
+            if any(a <= x < c and b <= y < d for a, b, c, d in rects):
+                cov += 1
+        if cov > limit:                                # enough to call it covered
+            break
+    return cov * step * step / area
+
+
+def is_unobscured(hwnd=None):
+    return covered_fraction(hwnd) < 0.02
 
 
 def grab(rect):

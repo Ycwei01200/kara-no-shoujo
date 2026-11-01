@@ -11,6 +11,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, '..', 'data')
 PHOTO = os.path.join(DATA, 'img', 'pc', 'tw', 'game', 'note', 'icon')
 
+ACT_RE = re.compile(r'\[\s*(act\d+)\s*\]', re.I)
 PUNCT = re.compile(r'[\s　「」『』（）()、，,。．.…‥・·•！!？?：:；;“”"‘’\'\-—―～~〈〉《》【】\[\]]+')
 
 
@@ -21,6 +22,32 @@ def norm(s):
 def whole_line(name, t):
     """OCR line t is (almost) exactly the label `name`."""
     return t == name or (name in t and len(t) <= len(name) + 2)
+
+
+SEARCH_MARKS = ('結束調查', '進行調查', '結束調', '進行調')       # buttons of the investigation screen
+HINTS = os.path.join(DATA, 'hints')
+MAP_MARKS = ('選擇要去的場所', '擇要去的場所', '要去的場所')     # header of the map screen
+DEDUC_MARK = '進行推理'                                  # shown only while a deduction is open
+NOTEBOOK_MARKS = ('回顧歷史訊息', '回歷史訊息', '手帳')
+SETTINGS_MARKS = ('進行配置設定', '進行置設定', '配置設定')      # config screen opened over the game
+LIST_NO = re.compile(r'^[A-Za-z0-9]{1,4}')
+
+
+def marked(texts, marks, slack=3):
+    """Some OCR line is (about) one of the UI labels `marks`, not a dialogue line containing it."""
+    return any(m in t and len(t) <= len(m) + slack for t in texts for m in marks)
+
+
+def fuzzy_line(name, t):
+    """Like whole_line, but allows OCR misreads in longer labels ('多磿陵園' for '多磨陵園')."""
+    if whole_line(name, t):
+        return True
+    t = LIST_NO.sub('', t)          # list numbers glued to the name ('D02', '82')
+    if whole_line(name, t):
+        return True
+    if len(name) < 4 or abs(len(t) - len(name)) > 3:
+        return False
+    return difflib.SequenceMatcher(None, name, t).ratio() >= 0.7
 
 
 # ------------------------------------------------------------------ data
@@ -94,8 +121,8 @@ class GuideData:
 
     def list_screen(self, ocr_lines):
         texts = [norm(t) for t, _ in ocr_lines]
-        p = sum(1 for t in texts if any(whole_line(n, t) for n in self.person_names))
-        e = sum(1 for t in texts if any(whole_line(n, t) for n in self.evid_names))
+        p = sum(1 for t in texts if any(fuzzy_line(n, t) for n in self.person_names))
+        e = sum(1 for t in texts if any(fuzzy_line(n, t) for n in self.evid_names))
         if p >= 4 and p >= e:
             return '人物'
         if e >= 3:
@@ -104,6 +131,10 @@ class GuideData:
 
 
 # ------------------------------------------------------------------ ocr worker
+class _Skip(Exception):
+    pass
+
+
 class Watcher(threading.Thread):
     """Grabs the game window every `interval` s and posts ('ocr', (rect, lines)),
     ('status', msg) or ('error', msg) to the queue."""
@@ -113,7 +144,7 @@ class Watcher(threading.Thread):
         self.q, self.interval = out_q, interval
         self.paused = False
         self.stop_flag = False
-        self.exclude = None   # screen rect (x, y, w, h) to blank out (our own window)
+        self.exclude = []     # screen rects (x, y, w, h) to blank out (our own windows)
 
     def run(self):
         try:
@@ -128,21 +159,29 @@ class Watcher(threading.Thread):
             if not self.paused:
                 status = None
                 try:
-                    rect = ocr.find_game_window()
+                    found = ocr.find_game_window(with_title=True)
+                    rect, title = found if found else (None, '')
                     if not rect:
                         status = '找不到遊戲視窗（要開著遊戲、不能最小化）'
                     else:
+                        if not ocr.is_unobscured():
+                            # (forcing the game to repaint for a capture makes it flicker, so wait)
+                            status = '遊戲視窗被其他視窗蓋住，切回遊戲就會繼續偵測'
+                            raise _Skip
                         img = ocr.grab(rect)
-                        ex = self.exclude
-                        if ex:
+                        if self.exclude:
                             from PIL import ImageDraw
-                            x, y = ex[0] - rect[0], ex[1] - rect[1]
-                            ImageDraw.Draw(img).rectangle((x, y, x + ex[2], y + ex[3]), fill=(0, 0, 0))
+                            dr = ImageDraw.Draw(img)
+                            for ex in list(self.exclude):
+                                x, y = ex[0] - rect[0], ex[1] - rect[1]
+                                dr.rectangle((x, y, x + ex[2], y + ex[3]), fill=(0, 0, 0))
                         lines = ocr.recognize(img)
-                        sig = tuple(t for t, _ in lines)
+                        sig = (title, tuple(t for t, _ in lines))
                         if sig != last:
                             last = sig
-                            self.q.put(('ocr', (rect, lines)))
+                            self.q.put(('ocr', (rect, lines, title)))
+                except _Skip:
+                    pass
                 except Exception as e:
                     status = f'OCR 錯誤：{e}'
                 if status != last_status:
@@ -159,6 +198,14 @@ class Tracker:
 
     def __init__(self, gd, ending, ptr=0):
         self.gd = gd
+        # every deduction in the game: its question / wrong-answer blocks -> entry
+        self.ded_by_block = defaultdict(list)
+        for e in gd.routes.get('deductions', []):
+            for b in e['ask_blocks']:
+                self.ded_by_block[(e['file'], b)].append((e, 'ask'))
+            self.ded_by_block[(e['file'], e['block'])].append((e, 'wrong'))
+        self.cur_deduc = None       # the deduction whose question/retry text was seen last
+        self.last_file = None
         self.set_ending(ending, ptr)
 
     def set_ending(self, ending, ptr=0):
@@ -166,6 +213,12 @@ class Tracker:
         e = self.gd.routes['endings'][ending]
         self.steps = e['steps']
         self.title = e['title']
+        self.acts = e.get('acts', {})
+        # blocks shown right before a deduction opens (its question) -> step
+        self.deduc_blocks = defaultdict(list)
+        for i, s in enumerate(self.steps):
+            for b in s.get('ask_blocks', []):
+                self.deduc_blocks[(s['file'], b)].append(i)
         self.file_steps = defaultdict(list)
         for i, s in enumerate(self.steps):
             for f in s['files_before']:
@@ -175,20 +228,66 @@ class Tracker:
         self.ptr = max(0, min(ptr, len(self.steps)))
         self.offroute = False
         self.pending_deduc = None   # step index of the deduction just answered
+        self.act = None             # chapter from the game's window title
+        self.synced_act = None
+        self.in_deduction = False   # saw '進行推理' and no normal dialogue since
+        self.cur_deduc = None
 
     # -- step lookup: forward first, then nearest backward
-    def _find(self, pred, ahead):
+    def _find(self, pred, ahead, act=False):
         n = len(self.steps)
+        ok = (lambda i: pred(self.steps[i]) and self._in_act(i)) if act else (lambda i: pred(self.steps[i]))
         for i in range(self.ptr, min(n, self.ptr + ahead)):
-            if pred(self.steps[i]):
+            if ok(i):
                 return i
         for i in range(min(self.ptr, n) - 1, max(-1, self.ptr - 4), -1):
-            if pred(self.steps[i]):
+            if ok(i):
                 return i
         return None
 
-    def classify(self, rect, lines):
+    def act_range(self, act):
+        """Steps that can be reached while the title shows `act` (inclusive)."""
+        acts = self.acts
+        if act not in acts:
+            return None
+        n = int(act[3:])
+        later = [v for k, v in acts.items() if int(k[3:]) > n]
+        return acts[act], (min(later) if later else len(self.steps))
+
+    def sync_title(self, title):
+        """Window title shows the chapter ('[ act24 ]'): keep ptr inside it."""
+        m = ACT_RE.search(title or '')
+        self.act = m.group(1).lower() if m else None
+        if not self.act or self.act == self.synced_act:
+            return
+        r = self.act_range(self.act)
+        if r is None:
+            return
+        self.synced_act = self.act
+        if not (r[0] <= self.ptr <= r[1]):
+            self.ptr = r[0]
+            self.pending_deduc = None
+
+    def _in_act(self, i):
+        r = self.act_range(self.act) if self.act else None
+        return r is None or r[0] <= i <= r[1]
+
+    def _next_is_deduction(self):
+        """The next route decision (searches skipped) is a deduction in this chapter."""
+        for i in range(self.ptr, len(self.steps)):
+            if self.steps[i]['kind'] != 'search':
+                return self.steps[i]['kind'] in ('deduc', 'deduc3') and self._in_act(i)
+        return False
+
+    def classify(self, rect, lines, title=''):
         """-> (kind, step) with kind in select/map/deduc (hint), offselect, or (None, None)."""
+        self.sync_title(title)
+        texts = [norm(t) for t, _ in lines]
+        if marked(texts, SEARCH_MARKS):
+            return 'search', self._find(lambda s: s['kind'] == 'search', 4, act=True)
+        if marked(texts, MAP_MARKS):
+            # place labels may not be readable; the route's next map move in this chapter
+            return 'map', self._find(lambda s: s['kind'] == 'map', 4, act=True)
         if self.gd.is_map_screen(lines):
             seen = self.gd.visible_places(lines)
             return 'map', self._find(lambda s: s['kind'] == 'map' and norm(s['choice_text']) in seen
@@ -204,13 +303,33 @@ class Tracker:
                 return 'offselect', None
             self.offroute = False
             return 'select', i
-        lst = self.gd.list_screen(lines)
-        if lst:
-            i = self._find(lambda s: s['kind'] in ('deduc', 'deduc3') and s['list'] == lst, 4)
+        if marked(texts, SETTINGS_MARKS):
+            return 'hold', None                     # config screen: keep whatever is shown
+        if marked(texts, (DEDUC_MARK,)):
+            self.in_deduction = True
+        notebook = marked(texts, NOTEBOOK_MARKS, 2) or any('人物名單' in t and '筆記' in t for t in texts)
+        if notebook and self.cur_deduc:
+            e = self.cur_deduc
+            ids = (f"deduc:{e['file']}:{e['block']}", f"deduc3:{e['file']}:{e['block']}")
+            for i, s in enumerate(self.steps):
+                if s['id'] in ids:
+                    return 'deduc', i
+            return 'deduc_x', e                     # not on the target route: still must be answered
+        lst_now = self.gd.list_screen(lines) if notebook else None
+        if notebook and (self.in_deduction or self._next_is_deduction()):
+            # names in the person list are vertical and unreadable; the chapter's next deduction it is
+            i = self._find(lambda s: s['kind'] in ('deduc', 'deduc3')
+                           and (lst_now is None or s['list'] == lst_now), 6, act=True)
             if i is not None:
                 return 'deduc', i
-        self.track_dialog(rect, lines)
-        return None, None
+            return 'hold', None
+        lst = self.gd.list_screen(lines)
+        if lst:
+            # the deduction screen and the notebook look the same; only hint a deduction of this chapter
+            i = self._find(lambda s: s['kind'] in ('deduc', 'deduc3') and s['list'] == lst, 4, act=True)
+            if i is not None:
+                return 'deduc', i
+        return None, ('dialog' if self.track_dialog(rect, lines) else None)
 
     def leave(self, kind, i):
         """The hinted screen disappeared: the choice was made."""
@@ -220,18 +339,44 @@ class Tracker:
         self.pending_deduc = i if kind == 'deduc' and self.steps[i]['kind'] == 'deduc' else None
 
     def track_dialog(self, rect, lines):
+        """Follow the story by dialogue. True if a script line was recognised."""
         long_lines = [t for t, _ in lines if len(norm(t)) >= 6]
         if len(long_lines) >= self.BACKLOG_LINES:
-            return                      # backlog / save-load screen: old text, ignore
+            return False                # backlog / save-load screen: old text, ignore
         h = rect[3]
         bottom = [t for t, bb in lines if bb[1] > h * 0.55]
         if not bottom:
-            return
+            return False
         cands = []
         for c in [''.join(bottom)] + sorted(bottom, key=len, reverse=True)[:2]:
             cands += self.gd.match_line(c)
         if not cands:
-            return
+            return False
+        self._follow(cands)
+        return True
+
+    def _follow(self, cands):
+        self.in_deduction = False       # back to normal dialogue
+        # leaving an investigation: its exit script is '<search file>z'
+        cur = self.steps[self.ptr] if self.ptr < len(self.steps) else None
+        if cur and cur['kind'] == 'search' and any(f.endswith('z') and 'search:' + f[:-1] == cur['id']
+                                                   for f, _, _ in cands):
+            self.ptr += 1
+        files = {f for f, _, _ in cands}
+        if len(files) == 1:
+            self.last_file = next(iter(files))      # an unambiguous line tells the current scene
+        hits = [(e, why) for f, b, _ in cands for e, why in self.ded_by_block.get((f, b), [])]
+        if len({e['file'] for e, _ in hits}) > 1:   # generic line ('我翻開筆記本。'): keep this scene's
+            hits = [(e, why) for e, why in hits if e['file'] == self.last_file]
+        if hits:
+            asks = [e for e, why in hits if why == 'ask']
+            pool = asks or [e for e, _ in hits]
+            if self.cur_deduc in pool:
+                pass                    # e.g. the shared '不──不對。' of a retry
+            else:
+                self.cur_deduc = min(pool, key=lambda e: e['block'])
+        else:
+            self.cur_deduc = None
         # deduction retry: the "wrong answer" reaction of the deduction we just left
         pd = self.pending_deduc
         if pd is not None:
@@ -242,9 +387,15 @@ class Tracker:
                 return
             if any(f == s['file'] and b == s.get('right_block') for f, b, _ in cands):
                 self.pending_deduc = None
+        # the question text of a deduction pins down exactly which one is coming
+        dq = [i for f, b, _ in cands for i in self.deduc_blocks.get((f, b), []) if self._in_act(i)]
+        if dq:
+            self.ptr = min(dq, key=lambda i: (abs(i - self.ptr), i))
+            self.offroute = False
+            return
         best = None
         for f, b, sc in cands:
-            idxs = self.file_steps.get(f)
+            idxs = [i for i in self.file_steps.get(f, []) if self._in_act(i)]
             if not idxs:
                 continue
             fwd = [i for i in idxs if i >= self.ptr]
@@ -274,6 +425,19 @@ def alternatives(gd, s):
             for k, v in pts.items() if k != str(s['choice'])]
 
 
+def deduc_x_text(e):
+    ans = e['answers']
+    labels = {a['label'] for a in ans}
+    if len(ans) == 1:
+        main = f'選「{ans[0]["text"]}」'
+    else:
+        main = '可選：' + '／'.join(a['text'] for a in ans)
+    sub = '這題不在目標路線上（你走的路線和目標不同），但要答對才能繼續。'
+    if len(labels) > 1:
+        sub += '\n不同答案會走向不同劇情。'
+    return main, sub
+
+
 def hint_text(gd, tracker, i):
     s = tracker.steps[i]
     if s['kind'] == 'select':
@@ -282,6 +446,9 @@ def hint_text(gd, tracker, i):
         main = f'去「{s["choice_text"]}」'
     elif s['kind'] == 'deduc':
         main = f'選「{s["choice_text"]}」'
+    elif s['kind'] == 'search':
+        n = sum(1 for c in s['clicks'] if c not in (0, 'R'))
+        main = f'搜查：照圖上的數字點 {n} 下'
     else:
         main = f'選：{s["choice_text"]}'
     sub = []
@@ -293,4 +460,9 @@ def hint_text(gd, tracker, i):
         sub.append('其他：' + '；'.join(others[:2]))
     if s['kind'] == 'deduc':
         sub.append('答錯只會重來')
+    if s['kind'] == 'search':
+        sub.append('同一處標「5·7」= 第 5、第 7 下都點這裡')
+        if 'Z' in s['clicks']:
+            sub.append('有兩張圖時：左圖點完會放大成右圖，右圖點完按「返回」')
+        sub.append('點完再按「結束調查」')
     return main, '\n'.join(sub)

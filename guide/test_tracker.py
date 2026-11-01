@@ -72,5 +72,23 @@ plist = [(names[str(c)], (0, 100 + 30 * c, 0, 0)) for c in (1, 2, 5, 6, 7)]
 check('person list detected', gd.list_screen(plist) == '人物')
 check('dialogue not a list', gd.list_screen([(f'{names["1"]}和{names["2"]}說{names["5"]}找{names["6"]}', (0, 600, 0, 0))]) is None)
 
+# 6. window title '[ act24 ]' pulls a wrong pointer into that chapter
+tr = Tracker(gd, '11', 121)
+r = tr.act_range('act24')
+tr.classify(RECT, [], '殼之少女HD - Ver1.0.0H [ act24 ]')
+check('title act24 -> ptr in chapter', r[0] <= tr.ptr <= r[1], f'ptr={tr.ptr} range={r}')
+d24 = tr.ptr
+
+# 7. deduction screen (same look as the notebook, header 回顧歷史訊息) in act24
+book = [('回顧歷史訊息', (450, 300, 560, 320))] + plist
+k, i = tr.classify(RECT, book, '殼之少女HD - Ver1.0.0H [ act24 ]')
+check('deduction list in act24', k == 'deduc' and steps[i]['choice_text'].endswith('間宮心爾）'),
+      f'{k} {i} {steps[i]["choice_text"] if i is not None else ""}')
+
+# 8. a chapter without deductions never shows a deduction hint
+tr2 = Tracker(gd, '11', 0)
+k, i = tr2.classify(RECT, book, '殼之少女HD - Ver1.0.0H [ act01 ]')
+check('no deduction in act01 -> no hint', k is None, f'{k} {i}')
+
 print('failures:', fails)
 sys.exit(1 if fails else 0)

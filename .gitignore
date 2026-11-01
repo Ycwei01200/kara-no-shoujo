@@ -8,3 +8,4 @@ __pycache__/
 .venv/
 guide/settings.json
 guide/pet_settings.json
+guide/pet.log

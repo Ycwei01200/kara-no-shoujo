@@ -294,13 +294,19 @@ class App:
         finally:
             self.root.after(200, self.poll)
 
-    def handle_ocr(self, rect, lines):
+    def handle_ocr(self, rect, lines, title=""):
         self.status.configure(text=f'OCR 執行中 · 遊戲視窗 {rect[2]}×{rect[3]}', fg=DIM)
         old = self.ptr
-        kind, i = self.tr.classify(rect, lines)
-        if kind in ('select', 'map', 'deduc') and i is not None:
+        kind, i = self.tr.classify(rect, lines, title)
+        if kind is None and i == 'dialog':
+            i = None
+        if kind in ('hold', 'deduc_x'):
+            if kind == 'deduc_x':
+                self.where.configure(text='推理（不在目標路線上）：' + '／'.join(a['text'] for a in i['answers']), fg=WARN)
+            return
+        if kind in ('select', 'map', 'deduc', 'search') and i is not None:
             self.ptr = i
-            label = {'select': '選項', 'map': '地圖', 'deduc': '推理清單'}[kind]
+            label = {'select': '選項', 'map': '地圖', 'deduc': '推理清單', 'search': '搜查'}[kind]
             self.where.configure(text=f'偵測到{label}畫面 ✓', fg=OK)
         elif kind == 'offselect':
             self.where.configure(text='偵測到選項畫面，但這題不在目前路線上', fg=WARN)
@@ -318,8 +324,8 @@ def main():
         pass
     root = tk.Tk()
     app = App(root)
-    root.bind('<Configure>', lambda e: setattr(app.watcher, 'exclude', (
-        root.winfo_rootx(), root.winfo_rooty(), root.winfo_width(), root.winfo_height())))
+    root.bind('<Configure>', lambda e: setattr(app.watcher, 'exclude', [(
+        root.winfo_rootx(), root.winfo_rooty(), root.winfo_width(), root.winfo_height())]))
     root.mainloop()
 
 

@@ -55,7 +55,11 @@ def t2():
     frame([(o, False) for o in sel['options']])
     results.append(('select hint', p.b_main.cget('text'), p.b_sub.cget('text'), p.tr.ptr))
     shot('pet_select.png')
-    frame([('玲人', True)])
+    nxt = steps[si + 1]['files_before'][-1] if steps[si + 1]['files_before'] else steps[si + 1]['file']
+    import json as _j
+    line = next(t for f, b, n, t in _j.load(open(os.path.join(pet.HERE, '..', 'data', 'textindex.json'),
+                                                   encoding='utf-8'))['lines'] if f == nxt and len(t) >= 10)
+    frame([(line, True)])                                     # story continues = choice made
     results.append(('after select ptr', p.tr.ptr, 'expected', si + 1))
     root.after(1800, t3)
 
